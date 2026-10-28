@@ -1,0 +1,11 @@
+UHPC AI Studio — DU AN MOI
+
+1. Giai nen ZIP vao 1 thu muc moi.
+2. Mo thu muc bang VS Code.
+3. Cai Python 3.11 hoac 3.12.
+4. Bam dup TAI_MO_HINH_WINDOWS.bat (can Internet) de tai model goc.
+5. Bam dup CHAY_WEB_WINDOWS.bat de chay web.
+6. Mo http://localhost:8501.
+7. Muon dua len Internet: tao repository Github moi, upload TOAN BO cac tep trong thu muc (gom assets/), sau do Deploy Streamlit.
+
+Khong can thay doi du an Github cu.
