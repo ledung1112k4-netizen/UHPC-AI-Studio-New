@@ -5,7 +5,8 @@ Không huấn luyện mô hình, không tự sinh cường độ thực nghiệm
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from itertools import product
 from typing import Any
 
 import numpy as np
@@ -147,6 +148,9 @@ class DesignRules:
     # Trọng số kỹ thuật: 0 = chỉ giảm xi măng; >0 = ưu tiên giảm cả sợi.
     # Không đại diện chi phí thị trường, không dùng thay kết quả thí nghiệm.
     steel_saving_weight: float = 1.0
+    # strict: requires a matching combination in training; exploratory: allow
+    # a model prediction, with an explicit out-of-distribution warning.
+    similarity_policy: str = "strict"
 
     def validate(self) -> None:
         if not (0 < self.wb_min <= self.wb_max < 1):
@@ -173,6 +177,8 @@ class DesignRules:
             raise ValueError("Trọng số ưu tiên giảm sợi thép phải thuộc 0–10.")
         if not np.isfinite(self.margin_mpa) or self.margin_mpa < 0:
             raise ValueError("Biên dự phòng cường độ không được âm.")
+        if self.similarity_policy not in {"strict", "report_only"}:
+            raise ValueError("Chế độ kiểm soát ngoại suy không hợp lệ.")
 
 
 def material_policies(rules: DesignRules) -> dict[str, str]:
@@ -220,6 +226,23 @@ def count_training_matches(training: pd.DataFrame, rules: DesignRules, steel_den
     steel = pd.to_numeric(training["Soi_thep"], errors="coerce").to_numpy(dtype=float)
     mask &= np.isfinite(steel) & (steel >= -1e-8) & (steel <= max_steel + 1e-8)
     return int(np.sum(mask))
+
+
+def count_presence_matches(training: pd.DataFrame, mix: dict[str, float]) -> int:
+    """Đếm mẫu train trùng 4 trạng thái có/không; KHÔNG là xác thực MPa.
+
+    Tách logic khỏi optional: khi vật liệu 'tùy chọn', nghiệm cuối có thể sử
+    dụng hoặc bằng đúng 0 và cần được kiểm tra theo trạng thái thực của nghiệm.
+    """
+    cols = ("Tro_bay", "Xil_lo_cao", "Silica_fume", "Bot_thach_anh")
+    if any(k not in training for k in cols):
+        raise ValueError("Dữ liệu thiếu thành phần để so sánh trạng thái có/không.")
+    mask = np.ones(len(training), dtype=bool)
+    for key in cols:
+        values = pd.to_numeric(training[key], errors="coerce").to_numpy(dtype=float)
+        mask &= np.isfinite(values)
+        mask &= ((values > 1e-6) == (float(mix[key]) > 1e-6))
+    return int(mask.sum())
 
 
 def steel_limit_kg_m3(rules: DesignRules, steel_density: float) -> float:
@@ -406,7 +429,7 @@ def bound_warnings(features: pd.DataFrame, training_bounds: dict[str, tuple[floa
     return warnings
 
 
-def optimize_mix(
+def _optimize_single_branch(
     model: Any,
     feature_cols: list[str],
     training_bounds: dict[str, tuple[float, float]],
@@ -448,16 +471,15 @@ def optimize_mix(
     support_count = None
     if training is not None:
         support_count = count_training_matches(training, rules, densities["Soi_thep"])
-        if support_count == 0:
+        if support_count == 0 and rules.similarity_policy == "strict":
             raise ValueError(
-                "Không có mẫu huấn luyện nào khớp tổ hợp chất liên kết và ngưỡng tối thiểu "
-                "đang chọn. Hãy chọn tổ hợp có dữ liệu thực, hoặc bổ sung dữ liệu và huấn luyện lại; "
-                "không tối ưu ngoài phân bố này."
+                "Không có mẫu train cùng tổ hợp vật liệu. Chế độ an toàn không "
+                "tối ưu tổ hợp chưa được học; hãy chọn 'Khám phá có cảnh báo ngoại suy' "
+                "để xem ứng viên nghiên cứu, không phải cấp phối đã kiểm chứng."
             )
-    elif rules.binder_mode != "BOTH" or rules.silica_mode != "optional" or rules.quartz_mode != "optional":
+    elif rules.similarity_policy == "strict":
         raise ValueError(
-            "Cần assets/training_features.csv để xác minh dữ liệu cho tổ hợp chất liên kết "
-            "đã chọn. Hiện chỉ giữ chế độ mặc định khi chưa có tệp này."
+            "Chế độ an toàn cần CSV huấn luyện để kiểm tra tổ hợp vật liệu."
         )
 
     fiber_cap_kg = steel_limit_kg_m3(rules, densities["Soi_thep"])
@@ -554,6 +576,11 @@ def optimize_mix(
         ),
     }
     physical_checks.update(uhpc_eng.mix_checks(proposal, float(target_mpa)))
+    presence_count = count_presence_matches(training, proposal) if training is not None else None
+    if rules.similarity_policy == "strict":
+        physical_checks["Trạng thái sử dụng vật liệu có mặt trong tập train"] = (
+            presence_count is not None and presence_count > 0
+        )
     for k, policy in policies.items():
         if policy == "off":
             ok = abs(proposal[k]) <= 1e-8
@@ -565,12 +592,23 @@ def optimize_mix(
             ok = proposal[k] >= -1e-8
             label = f"{LABELS[k]} tùy chọn"
         physical_checks[label] = ok
+    # Số lượng mẫu hỗ trợ cuối cùng dựa trên trạng thái có/không của cấp phối,
+    # không dựa riêng chính sách optional trước khi chạy tối ưu.
+    raw_policy_support_count = support_count
+    support_count = presence_count
     warnings = list(extra)
-    if support_count is not None and support_count < 10:
+    if support_count == 0:
         warnings.append(
-            f"Chỉ có {support_count} mẫu huấn luyện khớp tổ hợp đang chọn; "
-            "độ tin cậy của tối ưu có thể thấp."
+            "NGOẠI SUY TỔ HỢP: không có mẫu train với đúng trạng thái vật liệu "
+            "đang chọn. Dự đoán AI chưa được kiểm chứng cho công thức này."
         )
+    elif support_count is not None and support_count < 10:
+        warnings.append(
+            f"Chỉ có {support_count} dòng train khớp trạng thái vật liệu; "
+            "độ tin cậy của phương án nghiên cứu có thể thấp."
+        )
+    if training is None:
+        warnings.append("Không có dữ liệu CSV để kiểm tra trạng thái vật liệu và ngoại suy.")
     if proposal["Tro_bay"] == 0:
         warnings.append("Mô hình vẫn nhận các đặc trưng hóa lý tro bay cố định kể cả khi FA = 0; kiểm chứng ngoại suy là cần thiết.")
     if proposal["Xil_lo_cao"] == 0:
@@ -588,6 +626,15 @@ def optimize_mix(
         "binder_label": BINDER_CHOICES[rules.binder_mode],
         "material_policies": policies,
         "training_support_count": support_count,
+        "policy_training_support_count": raw_policy_support_count,
+        "evidence_status": (
+            "Không có dữ liệu hỗ trợ" if support_count is None else
+            "Ngoại suy tổ hợp — chưa có mẫu trùng" if support_count == 0 else
+            "Ít mẫu cùng trạng thái vật liệu" if support_count < 10 else
+            "Có mẫu cùng trạng thái — chưa phải xác nhận thí nghiệm"
+        ),
+        "extrapolation_warning": (support_count is None or support_count == 0),
+        "similarity_policy": rules.similarity_policy,
         "feasible_candidates_seen": best_feasible["count"],
         "selected_from_feasible_candidates": selected_feasible,
         "steel_limit_kg_m3": fiber_cap_kg,
@@ -596,3 +643,115 @@ def optimize_mix(
         "steel_saving_weight": rules.steel_saving_weight,
         "weighted_material_score": proposal["Xi_mang"] + rules.steel_saving_weight * proposal["Soi_thep"],
     }
+
+
+def _optional_subdesigns(rules: DesignRules) -> list[DesignRules]:
+    """Tùy chọn = khảo sát cả chính xác 0 và nhánh có thể sử dụng >0.
+
+    Với phương pháp tối ưu liên tục, xác suất tự chạm chính xác 0 gần bằng 0;
+    việc phân nhánh bảo đảm không bỏ sót các tổ hợp không dùng SF/QP/FA/GGBFS.
+    """
+    policy = material_policies(rules)
+    options = [name for name, status in policy.items() if status == "optional"]
+    variants = []
+    for combo in product(("optional", "off"), repeat=len(options)):
+        statuses = dict(zip(options, combo))
+        if not options:
+            variants.append(rules)
+            continue
+        updated = dict(
+            binder_mode="CUSTOM" if any(k in statuses for k in ("Tro_bay", "Xil_lo_cao")) else rules.binder_mode,
+            custom_fa=statuses.get("Tro_bay", policy["Tro_bay"]),
+            custom_ggbfs=statuses.get("Xil_lo_cao", policy["Xil_lo_cao"]),
+            silica_mode=statuses.get("Silica_fume", policy["Silica_fume"]),
+            quartz_mode=statuses.get("Bot_thach_anh", policy["Bot_thach_anh"]),
+        )
+        variants.append(replace(rules, **updated))
+    return variants
+
+
+def optimize_mix(
+    model: Any,
+    feature_cols: list[str],
+    training_bounds: dict[str, tuple[float, float]],
+    age: float,
+    fixed: dict[str, float],
+    densities: dict[str, float],
+    rules: DesignRules,
+    target_mpa: float,
+    max_cement: float,
+    mode: str = "Nhanh",
+    seed: int = 42,
+    training: pd.DataFrame | None = None,
+) -> dict[str, Any]:
+    """Thử các tổ hợp có/không dùng vật liệu tùy chọn, không bịa MPa.
+
+    Giữ cứng biên huấn luyện và các ngưỡng kỹ thuật. Ngoại suy tổ hợp
+    chỉ mở khi chọn chế độ khảo sát; kết quả luôn kèm mức độ hỗ trợ train.
+    """
+    rules.validate()
+    variants = _optional_subdesigns(rules)
+    results: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    for index, variant in enumerate(variants):
+        try:
+            out = _optimize_single_branch(
+                model, feature_cols, training_bounds, age, fixed, densities,
+                variant, target_mpa, max_cement, mode=mode,
+                seed=seed + index, training=training,
+            )
+            results.append(out)
+        except ValueError as exc:
+            # Chỉ bỏ qua nhánh không có giao với biên dữ liệu hoặc thiếu support
+            # khi đang ở chế độ strict; lỗi model/phần mềm khác cần được báo.
+            msg = str(exc)
+            expected = (
+                "Không có mẫu train", "Không thể đặt", "Ràng buộc",
+                "Không thể tối ưu", "không khả thi", "không giao",
+            )
+            if not any(t in msg for t in expected):
+                raise
+            skipped.append(msg)
+    if not results:
+        description = "; ".join(dict.fromkeys(skipped))
+        raise ValueError(
+            "Không có nhánh vật liệu nào đủ điều kiện để chạy tối ưu. "
+            + description[:700]
+        )
+
+    feasible_results = [r for r in results if r["feasible"]]
+    if feasible_results:
+        # Ưu tiên cả khả năng có mẫu train hỗ trợ để không tự chọn ngoại suy
+        # khi có phương án toán học hợp lệ đã xuất hiện trong các nhóm dữ liệu.
+        # Trước hết chọn cùng trạng thái đã học; sau đó giảm chi phí kỹ thuật.
+        selected = min(
+            feasible_results,
+            key=lambda r: (
+                bool(r["extrapolation_warning"]),
+                r["weighted_material_score"],
+                max(0.0, r["prediction"] - target_mpa),
+            ),
+        )
+    else:
+        # Ứng viên chẩn đoán — tuyệt đối không đưa ra như cấp phối đạt.
+        selected = min(
+            results,
+            key=lambda r: (
+                sum(not ok for ok in r["checks"].values()),
+                max(target_mpa - r["prediction"], 0.0),
+            ),
+        )
+    selected = dict(selected)
+    selected["branches_tried"] = len(variants)
+    selected["branches_computed"] = len(results)
+    selected["branches_skipped"] = len(skipped)
+    selected["alternatives_found"] = len(feasible_results)
+    selected["all_candidates_evaluated"] = sum(r["evaluations"] for r in results)
+    selected["user_material_policies"] = material_policies(rules)
+    selected["warnings"] = list(selected["warnings"])
+    if selected["extrapolation_warning"]:
+        selected["warnings"].insert(
+            0, "ỨNG VIÊN KHẢO SÁT NGOẠI SUY: không dùng để kết luận đạt cường độ, "
+            "chỉ dùng lập kế hoạch thử nghiệm thực tế."
+        )
+    return selected

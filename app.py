@@ -337,23 +337,32 @@ with tab_inverse:
         target = a.number_input("Cường độ yêu cầu (MPa)", min_value=120.0, max_value=250.0, value=120.0, step=5.0)
         age_opt = b.number_input("Tuổi nén (ngày)", min_value=1, max_value=365, value=28, step=1)
         mode = c.selectbox("Mức độ tìm kiếm", ["Nhanh", "Chuyên sâu"], index=0)
-        binder_mode = st.selectbox("Tổ hợp chất liên kết", list(BINDER_CHOICES),
-                                   format_func=lambda k: BINDER_CHOICES[k], index=0)
-        st.markdown("#### Trạng thái vật liệu")
+        binder_mode = "CUSTOM"  # 4 trạng thái độc lập, không khóa FA/GGBFS theo preset
+        st.markdown("#### Lựa chọn vật liệu linh hoạt")
+        st.caption("Tro bay, GGBFS, silica fume là thành phần khoáng/chất kết dính; "
+                   "bột thạch anh là chất độn. Các biến có thể chọn độc lập.")
         cols = st.columns(4)
-        fa_state = cols[0].selectbox("Tro bay", list(POLICY_CHOICES), format_func=lambda k: POLICY_CHOICES[k], index=0,
-                                      disabled=binder_mode != "CUSTOM")
-        gg_state = cols[1].selectbox("GGBFS", list(POLICY_CHOICES), format_func=lambda k: POLICY_CHOICES[k], index=0,
-                                      disabled=binder_mode != "CUSTOM")
-        sf_state = cols[2].selectbox("Silica fume", list(POLICY_CHOICES), format_func=lambda k: POLICY_CHOICES[k], index=1)
-        q_state = cols[3].selectbox("Bột thạch anh", list(POLICY_CHOICES), format_func=lambda k: POLICY_CHOICES[k], index=1)
-        st.caption("Tùy chọn = AI tìm trong phạm vi huấn luyện. Không sử dụng = bắt buộc 0 kg/m³. Nếu không có dữ liệu hỗ trợ, báo không khả thi.")
-        has_similarity = "similarity_policy" in getattr(DesignRules, "__dataclass_fields__", {})
-        safety_mode = None
-        if has_similarity:
-            safety_mode = st.radio("Kiểm soát ngoại suy",
-                                   ["Ưu tiên gần dữ liệu huấn luyện", "Khám phá có cảnh báo ngoại suy"],
-                                   horizontal=True, index=0)
+        fa_state = cols[0].selectbox("Tro bay (FA)", list(POLICY_CHOICES),
+                                     format_func=lambda k: POLICY_CHOICES[k], index=0)
+        gg_state = cols[1].selectbox("Xỉ lò cao (GGBFS)", list(POLICY_CHOICES),
+                                     format_func=lambda k: POLICY_CHOICES[k], index=0)
+        sf_state = cols[2].selectbox("Silica fume", list(POLICY_CHOICES),
+                                     format_func=lambda k: POLICY_CHOICES[k], index=1)
+        q_state = cols[3].selectbox("Bột thạch anh", list(POLICY_CHOICES),
+                                    format_func=lambda k: POLICY_CHOICES[k], index=1)
+        st.caption("Bắt buộc = có lượng tối thiểu nội bộ; Không sử dụng = đúng 0 kg/m³; "
+                   "Tùy chọn = thuật toán thử cả có dùng và không dùng (0 kg/m³).")
+        has_similarity = True
+        safety_mode = st.radio(
+            "Chế độ lựa chọn phương án",
+            ["Ưu tiên tổ hợp đã có trong tập huấn luyện", "Khám phá có cảnh báo ngoại suy"],
+            horizontal=True, index=1,
+            help="Khám phá cho phép tính thử hệ vật liệu chưa có mẫu đúng tổ hợp. "
+                 "Đây là ngoại suy và cần thí nghiệm xác nhận; không coi là cấp phối đạt thực tế.",
+        )
+        if safety_mode.startswith("Khám phá"):
+            st.warning("Chế độ khảo sát: AI có thể dự đoán cho tổ hợp chưa được huấn luyện "
+                       "(ví dụ FA+GGBFS với silica fume bằng 0). Không xác nhận cường độ thực nghiệm.")
         submit_opt = st.form_submit_button("⚗️ Tìm cấp phối bằng AI", type="primary", use_container_width=True,
                                            disabled=(model is None or bounds is None))
     sig_inverse = stable_signature({"target": target, "age": age_opt, "mode": mode, "binder": binder_mode,
@@ -380,7 +389,8 @@ with tab_inverse:
             if train is not None:
                 matches = count_training_matches(train, rules, densities["Soi_thep"])
                 if matches <= 0:
-                    st.warning("Không có dòng train cùng điều kiện vật liệu được chọn. Kết quả sẽ không được khẳng định đáng tin cậy.")
+                    st.warning("Không có dòng train cùng trạng thái vật liệu. "
+                               "Chế độ khảo sát sẽ vẫn thử tối ưu nhưng mọi kết quả đều là ngoại suy.")
             with st.spinner("AI đang tìm nghiệm và kiểm tra thể tích, W/B, biên huấn luyện..."):
                 result = optimize_mix(model, features, bounds, float(age_opt), fixed, densities, rules,
                                       target_mpa=float(target), max_cement=1000.0,
@@ -395,24 +405,38 @@ with tab_inverse:
         a, b, c = st.columns(3)
         a.metric("Mục tiêu", f"{outcome['target']:.1f} MPa")
         b.metric("AI dự đoán cho ứng viên", f"{outcome['prediction']:.1f} MPa")
-        c.metric("Ứng viên hợp lệ quan sát", f"{outcome.get('feasible_candidates_seen', 0):,}")
+        c.metric("Phương án tổ hợp đã thử", f"{outcome.get('branches_computed', 1)}/{outcome.get('branches_tried', 1)}")
+        st.caption(f"Mức hỗ trợ dữ liệu: {outcome.get('evidence_status', 'Chưa đánh giá')} • "
+                   f"Ứng viên hợp lệ quan sát: {outcome.get('feasible_candidates_seen', 0):,}")
         if outcome.get("feasible"):
-            st.success("Đã tìm thấy **ứng viên vượt qua ràng buộc toán học và bộ lọc kỹ thuật**. Đây KHÔNG phải cấp phối đã chứng minh đạt cường độ thực nghiệm.")
+            if outcome.get("extrapolation_warning"):
+                st.warning("⚠️ **Chỉ là ứng viên khảo sát ngoại suy.** AI có thể tính được giá trị MPa, "
+                           "nhưng tập huấn luyện không có tổ hợp vật liệu đúng cấu hình. "
+                           "Không coi đây là cấp phối đã xác nhận hoặc đủ tin cậy để thi công.")
+            else:
+                st.success("Đã tìm thấy **ứng viên đạt bộ lọc số học theo AI**. "
+                           "Vẫn cần thí nghiệm xác nhận cường độ và tính công tác.")
             show_calibration_info(outcome["prediction"], outcome["target"])
             show_similarity_info(outcome)
             show_metrics(outcome["mix"], outcome["age"])
-            st.markdown("### Bảng cấp phối đề xuất")
+            st.markdown("### Ứng viên nghiên cứu" if outcome.get("extrapolation_warning")
+                        else "### Bảng cấp phối đề xuất theo AI")
             show_mix_table(outcome["mix"], "nguoc")
             show_chart(outcome["mix"], "inverse_mix_chart")
         else:
             st.error("Chưa tìm được nghiệm thỏa đồng thời cường độ dự đoán, W/B, thể tích và giới hạn vật liệu. Không xuất ứng viên như cấp phối đạt yêu cầu.")
+            st.info("Có thể thử mục tiêu cường độ thấp hơn, chuyển vật liệu từ 'Không sử dụng' sang 'Tùy chọn', "
+                    "hoặc bổ sung thí nghiệm để huấn luyện lại. Không tự nới giới hạn kỹ thuật để báo đạt.")
             show_similarity_info(outcome)
         with st.expander("Chi tiết đánh giá điều kiện", expanded=False):
             st.dataframe(pd.DataFrame([{"Điều kiện": k, "Đạt": "✓" if v else "✗"}
                                        for k, v in outcome.get("checks", {}).items()]),
                          hide_index=True, use_container_width=True)
             if outcome.get("training_support_count") is not None:
-                st.caption(f"Số dòng train cùng tổ hợp vật liệu: {outcome['training_support_count']}. Không phải số thí nghiệm xác nhận cấp phối mới.")
+                st.caption(f"Dòng train trùng trạng thái vật liệu của phương án được chọn: "
+                           f"{outcome['training_support_count']}. Không phải số thử nghiệm kiểm chứng.")
+            st.caption(f"Số nhánh không thể chạy vì biên dữ liệu/ràng buộc: "
+                       f"{outcome.get('branches_skipped', 0)}.")
             for warning in outcome.get("warnings", []):
                 st.warning(warning)
 
